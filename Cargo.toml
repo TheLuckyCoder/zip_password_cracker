@@ -1,0 +1,18 @@
+[package]
+name = "zip_password_cracker"
+version = "1.0.0"
+edition = "2021"
+authors = ["Filea Razvan"]
+
+[profile.release]
+overflow-checks = false
+lto = true
+codegen-units = 1
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bruteforce = { version = "0.2", default-features = false, features = ["std", "constants"] }
+clap = { version = "4.0", features = ["derive"] }
+crossbeam-channel = "0.5"
+zip = "0.6"
