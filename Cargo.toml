@@ -8,11 +8,12 @@ authors = ["Filea Razvan"]
 overflow-checks = false
 lto = true
 codegen-units = 1
+#debug = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 bruteforce = { version = "0.2", default-features = false, features = ["std", "constants"] }
 clap = { version = "4.0", features = ["derive"] }
-crossbeam-channel = "0.5"
+concurrent-queue = "1.2"
 zip = "0.6"

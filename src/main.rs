@@ -1,21 +1,22 @@
+#![feature(iter_collect_into)]
+
+use std::io::{Cursor, Read};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use std::{fs, thread};
+
 use bruteforce::charset::Charset;
 use bruteforce::BruteForce;
 use clap::Parser;
-use crossbeam_channel::{bounded, Receiver, Sender};
-use std::fs::File;
-use std::io::Read;
-use std::os::unix::prelude::MetadataExt;
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::{fs, thread};
+use concurrent_queue::{ConcurrentQueue, PushError};
 use zip::ZipArchive;
 
 const DEFAULT_CHARSET: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
 #[derive(Parser, Debug)]
 struct Args {
-    #[arg(short, long, help = "The encrypted ZIP file")]
+    #[arg(short, long, help = "The encrypted ZIP file", default_value_t = String::from("/home/razvanf/Downloads/hello.zip"))]
     pub file: String,
     #[arg(short, long, help = "Enables some extra logging")]
     pub verbose: bool,
@@ -45,99 +46,130 @@ fn main() {
         args.thread_count
     };
 
-    let file_path = Path::new(args.file.as_str());
-    if !file_path.exists() {
-        eprintln!("Specified file does not exist {}", args.file)
-    }
+    let zip_file = Cursor::new(
+        fs::read(&args.file)
+            .unwrap_or_else(|_| panic!("Failed reading the ZIP file: {}", args.file)),
+    );
 
     println!("Starting to bruteforce password using {thread_count} threads");
+    let start = Instant::now();
 
     thread::scope(|s| {
         let is_alive = Arc::new(AtomicBool::new(true));
-        let (sender, receiver) = bounded::<String>(thread_count * 128);
+        let queue: Queue = Arc::new(ConcurrentQueue::bounded(thread_count * 4));
 
         let is_alive_clone = is_alive.clone();
+        let queue_clone = queue.clone();
         s.spawn(move || {
-            generate_passwords(
-                sender,
+            let passwords_generated = generate_passwords(
+                queue_clone,
                 is_alive_clone,
                 args.charset.as_str(),
                 args.min_length,
-            )
+            );
+
+            let stop = start.elapsed();
+            let elapsed_secs = stop.as_secs();
+            let per_second = passwords_generated as f64 / elapsed_secs as f64;
+            println!(
+                "Generated {passwords_generated} in {elapsed_secs} seconds ({per_second} passwords/s)"
+            );
         });
 
+        thread::sleep(Duration::from_millis(10));
+
         for i in 0..thread_count {
-            let receiver = receiver.clone();
             let is_alive = is_alive.clone();
+            let cursor = zip_file.clone();
+            let queue = queue.clone();
 
             thread::Builder::new()
                 .name(format!("checker-{i}"))
                 .spawn_scoped(s, move || {
-                    password_checker(receiver, is_alive, file_path, args.verbose)
+                    password_checker(queue, is_alive, cursor, args.verbose)
                 })
                 .expect("Failed to start thread");
         }
     });
 }
 
+type Queue = Arc<ConcurrentQueue<Vec<String>>>;
+
 fn generate_passwords(
-    sender: Sender<String>,
-    is_alive_clone: Arc<AtomicBool>,
+    concurrent_queue: Queue,
+    is_alive: Arc<AtomicBool>,
     charset: &str,
     min_length: usize,
-) {
-    let brute_force = BruteForce::new_at(Charset::new_by_str(charset), min_length);
+) -> usize {
+    const CAPACITY: usize = 8192;
+    let mut brute_force = BruteForce::new_at(Charset::new_by_str(charset), min_length);
 
-    for pass in brute_force {
-        if !is_alive_clone.load(Ordering::Relaxed) {
-            break;
+    let mut passwords_generated = 0usize;
+    while is_alive.load(Ordering::Relaxed) {
+        let mut passwords: Vec<String> = Vec::with_capacity(CAPACITY);
+        for _ in 0..CAPACITY {
+            passwords.push(brute_force.raw_next().to_string());
         }
 
-        match sender.send(pass) {
-            Ok(_) => {}
-            Err(_) => break, // channel disconnected, stop thread
+        while is_alive.load(Ordering::Relaxed) {
+            match concurrent_queue.push(passwords) {
+                Ok(_) => break,
+                Err(e) => match e {
+                    PushError::Full(value) => passwords = value, // Retry until we are able to push
+                    PushError::Closed(_) => {
+                        is_alive.store(false, Ordering::Relaxed);
+                        break; // channel disconnected, stop thread
+                    }
+                },
+            }
+            thread::yield_now();
         }
+        passwords_generated += CAPACITY;
     }
+
+    passwords_generated
 }
 
 fn password_checker(
-    receiver: Receiver<String>,
+    queue: Queue,
     is_alive: Arc<AtomicBool>,
-    file_path: &Path,
+    mut zip_file: Cursor<Vec<u8>>,
     verbose: bool,
 ) {
-    let file = File::open(file_path).expect("File should exist");
-    let mut archive = ZipArchive::new(file).expect("Archive already validated");
-    let mut read_buffer = Vec::with_capacity(fs::metadata(file_path).unwrap().size() as usize);
+    let mut read_buffer = Vec::with_capacity(zip_file.get_ref().len());
+    let mut archive = ZipArchive::new(&mut zip_file).expect("File should exist");
 
     while is_alive.load(Ordering::Relaxed) {
-        match receiver.recv() {
+        match queue.pop() {
             Err(_) => break,
-            Ok(password) => {
-                let res = archive
-                    .by_index_decrypt(0, password.as_bytes())
-                    .expect("Unexpected error");
+            Ok(passwords) => {
+                for password in passwords {
+                    let res = archive
+                        .by_index_decrypt(0, password.as_bytes())
+                        .expect("Unexpected error");
 
-                match res {
-                    Err(_) => (), // invalid password
-                    Ok(mut zip) => {
-                        if zip.size() as usize > read_buffer.capacity() {
-                            read_buffer.reserve(read_buffer.capacity() - zip.size() as usize);
-                        }
-
-                        if verbose {
-                            println!(
-                                "Potential password found: {password}. Checking the entire archive..."
-                            );
-                        }
-                        match zip.read_to_end(&mut read_buffer) {
-                            Err(_) => (), // password collision
-                            Ok(_) => {
-                                is_alive.store(false, Ordering::Relaxed);
-                                println!("Password found: {password}")
+                    match res {
+                        Err(_) => (), // invalid password
+                        Ok(mut zip) => {
+                            if zip.size() as usize > read_buffer.capacity() {
+                                read_buffer.reserve(read_buffer.capacity() - zip.size() as usize);
                             }
+
+                            if verbose {
+                                println!(
+                                    "Potential password found: {password}. Checking the entire archive..."
+                                );
+                            }
+                            match zip.read_to_end(&mut read_buffer) {
+                                Err(_) => (), // password collision
+                                Ok(_) => {
+                                    is_alive.store(false, Ordering::Relaxed);
+                                    println!("Password found: {password}");
+                                    break;
+                                }
+                            }
+                            read_buffer.clear()
                         }
-                        read_buffer.clear()
                     }
                 }
             }
